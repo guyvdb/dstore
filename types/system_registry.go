@@ -18,9 +18,9 @@ var _ store.Storable = (*RegistryItem)(nil)
 var _ store.Storable = (*RegistryInfo)(nil)
 
 type RegistryInfo struct {
-	Id           store.Id `json:"id"`
-	NextTypeId   int64    `json:"nextTypeId"`
-	NextObjectId int64    `json:"nextObjectId"`
+	Id           *store.Id `json:"id"`
+	NextTypeId   int64     `json:"nextTypeId"`
+	NextObjectId int64     `json:"nextObjectId"`
 }
 
 // Hardcoded type and object id's
@@ -90,6 +90,8 @@ func (r *SystemRegistry) Index(typeName string, propertyName string, indexType s
 }
 
 func (r *SystemRegistry) AllocateId(item store.Storable) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	info, found := r.typeNameIndex[item.GetTypeName()]
 	if !found {
@@ -125,6 +127,9 @@ func (r *SystemRegistry) Instance(typeId int64) (store.Storable, error) {
 		return &RegistryItem{}, nil
 	}
 
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	// Otherwise it is a user defined types
 	info, found := r.typeIdIndex[typeId]
 	if !found {
@@ -139,6 +144,9 @@ func (r *SystemRegistry) CreateInstance(typeId int64) (store.Storable, error) {
 }
 
 func (r *SystemRegistry) GetTypeId(typeName string) (int64, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	info, found := r.typeNameIndex[typeName]
 	if !found {
 		return 0, fault.ErrTypeNotFound
@@ -157,6 +165,9 @@ func (r *SystemRegistry) GetTypeName(typeId int64) (string, error) {
 		return "RegistryItem", nil
 	}
 
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	info, found := r.typeIdIndex[typeId]
 	if !found {
 		return "", fault.ErrTypeNotFound
@@ -165,6 +176,9 @@ func (r *SystemRegistry) GetTypeName(typeId int64) (string, error) {
 }
 
 func (r *SystemRegistry) Indexes(typeId uint64) []*store.IndexDefinition {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	info, found := r.typeIdIndex[int64(typeId)]
 	if !found {
 		return []*store.IndexDefinition{}
@@ -182,6 +196,9 @@ func (r *SystemRegistry) Indexes(typeId uint64) []*store.IndexDefinition {
 //	be incremented.
 //	The nextObjectId for this typeId should be retreived.
 func (r *SystemRegistry) Load(s store.Store) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var info *RegistryInfo
 
 	// save a reference to the store
@@ -201,7 +218,7 @@ func (r *SystemRegistry) Load(s store.Store) error {
 		if err == fault.ErrKeyNotFound {
 			// Create
 			info = &RegistryInfo{
-				Id:           *infoId,
+				Id:           infoId,
 				NextTypeId:   1001,
 				NextObjectId: 1001,
 			}
