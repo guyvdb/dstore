@@ -28,10 +28,17 @@ type Store interface {
 	AllocateBucketIfNeeded(typeName string) error
 
 	// Indexed Searches
-	// indexName is in the form of TypeName.PropertyName - eg : Product.BarCode
-	// The property must be indexed and of type string
-	StringExactMatch(indexName string, value string) (Storable, error)
-	StringWildcardMatch(indexName string, value string) ([]Storable, error)
+	// indexName is in the form of TypeName.PropertyName (e.g., "Product.BarCode").
+
+	// Match finds storables where an indexed property exactly matches the given value.
+	// The type of 'value' should correspond to the IndexDefinition.DataType of the indexed property.
+	// indexName is in the form of TypeName.PropertyName.
+	Match(indexName string, value interface{}) ([]Storable, error)
+
+	// WildcardMatch finds storables where an indexed string property matches the given wildcard pattern.
+	// indexName is in the form of TypeName.PropertyName.
+	// The property must be indexed and of type StringIndex.
+	WildcardMatch(indexName string, pattern string) ([]Storable, error)
 
 	Close() error
 }

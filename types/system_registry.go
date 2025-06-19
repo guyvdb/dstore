@@ -78,13 +78,13 @@ func (r *SystemRegistry) Register(typename string, factory TypeFactory) {
 	r.items = append(r.items, item)
 }
 
-func (r *SystemRegistry) Index(typeName string, propertyName string, indexType store.IndexType) {
+func (r *SystemRegistry) Index(typeName string, propertyName string, dataType store.IndexDataType, indexType store.IndexType) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	for _, item := range r.items {
 		if item.TypeName == typeName {
-			item.AddIndex(propertyName, indexType)
+			item.AddIndex(propertyName, dataType, indexType)
 		}
 	}
 }
@@ -318,9 +318,10 @@ func (ri *RegistryItem) GetTypeName() string {
 	return REGISTRY_ITEM_TYPE_NAME
 }
 
-func (ri *RegistryItem) AddIndex(propertyName string, indexType store.IndexType) {
+func (ri *RegistryItem) AddIndex(propertyName string, dataType store.IndexDataType, indexType store.IndexType) {
 	ri.Indexes = append(ri.Indexes, &store.IndexDefinition{
 		PropertyName: propertyName,
+		DataType:     dataType,
 		Type:         indexType,
 	})
 }

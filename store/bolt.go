@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
-
-	"reflect"
+	"math"
+	"time"
 
 	"github.com/guyvdb/dstore/fault"
 
@@ -76,52 +78,96 @@ func (bs *BoltStore) Put(m Storable) error {
 			if err != nil {
 				return err
 			}
-			slog.Debug("BoltStore.Put()", "indexName", string(indexBucketNameBytes))
+			slog.Debug("BoltStore.Put() indexing property", "indexBucketName", string(indexBucketNameBytes), "propertyName", index.PropertyName, "dataType", index.DataType.String())
+
+			typeNameForLog, _ := bs.typeManager.GetTypeName(id.TypeId) // Best effort for logging
+
 			idxbucket, err := tx.CreateBucketIfNotExists(indexBucketNameBytes)
 			if err != nil {
-				return fault.ErrBucketCreateFailed
+				return fmt.Errorf("failed to create index bucket %s: %w", string(indexBucketNameBytes), fault.ErrBucketCreateFailed)
 			}
 
-			// Use reflection to get the value of the PropertyName from m (Storable)
-			v := reflect.ValueOf(m)
-			// If m is a pointer, dereference it
-			if v.Kind() == reflect.Ptr {
-				v = v.Elem()
+			var propertyValueBytes []byte
+			var ok bool
+
+			switch index.DataType {
+			case StringIndex:
+				stringValue, success := GetIndexableStringValue(m, typeNameForLog, index.PropertyName)
+				if success {
+					propertyValueBytes = []byte(stringValue)
+				}
+				ok = success
+			case Int64Index:
+				intValue, success := GetIndexableIntValue(m, typeNameForLog, index.PropertyName)
+				if success {
+					// XOR with (1 << 63) to make signed int64 lexicographically sortable
+					// Negative numbers become 0..., positive numbers become 1...
+					uint64Val := uint64(intValue) ^ (1 << 63)
+					buf := make([]byte, 8)
+					binary.BigEndian.PutUint64(buf, uint64Val)
+					propertyValueBytes = buf
+				}
+				ok = success
+			case Float64Index:
+				floatValue, success := GetIndexableFloatValue(m, typeNameForLog, index.PropertyName)
+				if success {
+					bits := math.Float64bits(floatValue)
+					// For lexicographical sort of IEEE 754 floats:
+					// If positive (sign bit is 0), flip sign bit to 1.
+					// If negative (sign bit is 1), flip all bits.
+					if bits&(1<<63) == 0 { // Positive or +0
+						bits |= (1 << 63)
+					} else { // Negative or -0
+						bits = ^bits
+					}
+					buf := make([]byte, 8)
+					binary.BigEndian.PutUint64(buf, bits)
+					propertyValueBytes = buf
+				}
+				ok = success
+			case BoolIndex:
+				boolValue, success := GetIndexableBoolValue(m, typeNameForLog, index.PropertyName)
+				if success {
+					if boolValue {
+						propertyValueBytes = []byte{1} // True
+					} else {
+						propertyValueBytes = []byte{0} // False
+					}
+				}
+				ok = success
+			case DateTimeIndex:
+				timeValue, success := GetIndexableDateTimeValue(m, typeNameForLog, index.PropertyName)
+				if success {
+					// RFC3339Nano is lexicographically sortable and human-readable.
+					// Pre-allocate buffer for efficiency. Max length of RFC3339Nano is 35.
+					propertyValueBytes = timeValue.AppendFormat(make([]byte, 0, 35), time.RFC3339Nano)
+				}
+				ok = success
+			default:
+				slog.Warn("BoltStore.Put: Unknown or unsupported index data type", "dataType", index.DataType.String(), "typeName", typeNameForLog, "property", index.PropertyName)
+				continue // Skip this index
 			}
 
-			// Ensure we are dealing with a struct
-			if v.Kind() != reflect.Struct {
-				//slog.Warn("Indexed item is not a struct", "typeName", typeName, "index", index.PropertyName)
-				// Decide how to handle this - maybe skip indexing for this item?
+			if !ok {
+				// The GetIndexable<Type>Value function already logs the reason.
 				continue
 			}
 
-			field := v.FieldByName(index.PropertyName)
-
-			// Check if the field exists and is exportable
-			if !field.IsValid() || !field.CanInterface() {
-				//slog.Warn("Indexed property not found or not exportable", "typeName", typeName, "index", index.PropertyName)
-				// Decide how to handle this - maybe skip indexing for this property?
-				continue
-			}
-
-			// Check if the field is a string (as per current index methods)
-			if field.Kind() != reflect.String {
-				//slog.Warn("Indexed property is not a string", "typeName", typeName, "index", index.PropertyName, "kind", field.Kind())
-				// Decide how to handle this - maybe skip indexing for this property?
-				continue
-			}
-
-			propertyValue := field.String()
 			idBytes := []byte(id.String())
+			indexKey := buildIndexKey(index.Type, propertyValueBytes, id)
 
-			// Store in index bucket
-			// For non-unique, use a composite key propertyValue_objectId to ensure key uniqueness in BoltDB
-			// For unique, use propertyValue as key and check for conflicts
-			indexKey := buildIndexKey(index.Type, propertyValue, id)
+			if index.Type == UniqueIndex {
+				existingIdBytes := idxbucket.Get(indexKey)
+				if existingIdBytes != nil && !bytes.Equal(existingIdBytes, idBytes) {
+					// Value already exists for a different Storable ID, uniqueness constraint violation.
+					return fmt.Errorf("uniqueness constraint violation for index '%s' on property '%s': value already mapped to ID %s",
+						index.PropertyName, string(indexBucketNameBytes), string(existingIdBytes))
+				}
+			}
 
-			// TODO: Add uniqueness check for UniqueIndex before putting
-			idxbucket.Put(indexKey, idBytes)
+			if err := idxbucket.Put(indexKey, idBytes); err != nil {
+				return fmt.Errorf("failed to put index entry for %s: %w", index.PropertyName, err)
+			}
 		}
 
 		return nil
@@ -339,15 +385,24 @@ func (bs *BoltStore) getAllFromBucket( /*bucketName string,*/ typeId int64) ([]S
 // buildIndexKey creates the key for the index bucket based on index type.
 // For UniqueIndex, the key is the property value.
 // For NonUniqueIndex, the key is propertyValue_objectId to allow multiple items
-// with the same property value while maintaining unique keys in BoltDB.
-func buildIndexKey(indexType IndexType, propertyValue string, id *Id) []byte {
+// with the same property value while maintaining unique keys in BoltDB. The
+// propertyValueBytes are joined with the ID bytes using a null byte separator.
+func buildIndexKey(indexType IndexType, propertyValueBytes []byte, id *Id) []byte {
 	switch indexType {
 	case UniqueIndex:
-		return []byte(propertyValue)
+		return propertyValueBytes
 	case NonUniqueIndex:
-		return []byte(fmt.Sprintf("%s_%s", propertyValue, id.String()))
+		idBytes := []byte(id.String())
+		// Use a null byte as a separator. This is generally safe as propertyValueBytes
+		// from structured data (like numbers, specific string formats for time) are unlikely
+		// to naturally form sequences that would collide after appending a null byte and an ID.
+		key := make([]byte, 0, len(propertyValueBytes)+1+len(idBytes))
+		key = append(key, propertyValueBytes...)
+		key = append(key, 0) // Null byte separator
+		key = append(key, idBytes...)
+		return key
 	}
-	return nil // Should not happen with current IndexType values
+	return nil // Should not happen
 }
 
 // Delete removes a model by its key.
@@ -359,11 +414,11 @@ func (bs *BoltStore) AllocateId(item Storable) error {
 	return bs.typeManager.AllocateId(item)
 }
 
-func (bs *BoltStore) StringExactMatch(indexName string, value string) (Storable, error) {
+func (bs *BoltStore) Match(indexName string, value interface{}) ([]Storable, error) {
 	panic("not implemented")
 }
 
-func (bs *BoltStore) StringWildcardMatch(indexName string, value string) ([]Storable, error) {
+func (bs *BoltStore) WildcardMatch(indexName string, pattern string) ([]Storable, error) {
 	panic("not implemented")
 }
 

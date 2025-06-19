@@ -1,6 +1,8 @@
 package types
 
-import "github.com/guyvdb/dstore/store"
+import (
+	"github.com/guyvdb/dstore/store"
+)
 
 type TypeFactory func() store.Storable
 
@@ -13,7 +15,7 @@ type Registry interface {
 	Register(typename string, factory TypeFactory)
 
 	// Index a property
-	Index(typeName string, propertyName string, indexType store.IndexType)
+	Index(typeName string, propertyName string, dataType store.IndexDataType, indexType store.IndexType)
 
 	// Create a concrete type of a Storable
 	Instance(typeId int64) (store.Storable, error)
