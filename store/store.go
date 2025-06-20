@@ -13,7 +13,7 @@ type StoreTypeManager interface {
 	GetTypeId(typeName string) (int64, error)
 	GetTypeName(typeId int64) (string, error)
 	AllocateId(item Storable) error
-	Indexes(typeId uint64) []*IndexDefinition
+	Indexes(typeId int64) []*IndexDefinition
 }
 
 type Store interface {
