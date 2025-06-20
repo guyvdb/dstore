@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -34,6 +35,111 @@ func NewBoltStore(path string, typeManager StoreTypeManager) (Store, error) {
 
 	// Buckets for types will be created on demand.
 	return &BoltStore{db: db, typeManager: typeManager}, nil
+}
+
+func (bs *BoltStore) updateIndexes(tx *bbolt.Tx, m Storable) error {
+
+	id := m.GetId()
+
+	// Update any indexes
+	for _, index := range bs.typeManager.Indexes(id.TypeId) {
+		indexBucketNameBytes, err := bs.mkIndexBucketName(id.TypeId, index.PropertyName)
+		if err != nil {
+			return err
+		}
+		slog.Debug("BoltStore.Put() indexing property", "indexBucketName", string(indexBucketNameBytes), "propertyName", index.PropertyName, "dataType", index.DataType.String())
+
+		typeNameForLog, _ := bs.typeManager.GetTypeName(id.TypeId) // Best effort for logging
+
+		idxbucket, err := tx.CreateBucketIfNotExists(indexBucketNameBytes)
+		if err != nil {
+			return fmt.Errorf("failed to create index bucket %s: %w", string(indexBucketNameBytes), fault.ErrBucketCreateFailed)
+		}
+
+		var propertyValueBytes []byte
+		var ok bool
+
+		switch index.DataType {
+		case StringIndex:
+			stringValue, success := GetIndexableStringValue(m, typeNameForLog, index.PropertyName)
+			if success {
+				propertyValueBytes = []byte(stringValue)
+			}
+			ok = success
+		case Int64Index:
+			intValue, success := GetIndexableIntValue(m, typeNameForLog, index.PropertyName)
+			if success {
+				// XOR with (1 << 63) to make signed int64 lexicographically sortable
+				// Negative numbers become 0..., positive numbers become 1...
+				uint64Val := uint64(intValue) ^ (1 << 63)
+				buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(buf, uint64Val)
+				propertyValueBytes = buf
+			}
+			ok = success
+		case Float64Index:
+			floatValue, success := GetIndexableFloatValue(m, typeNameForLog, index.PropertyName)
+			if success {
+				bits := math.Float64bits(floatValue)
+				// For lexicographical sort of IEEE 754 floats:
+				// If positive (sign bit is 0), flip sign bit to 1.
+				// If negative (sign bit is 1), flip all bits.
+				if bits&(1<<63) == 0 { // Positive or +0
+					bits |= (1 << 63)
+				} else { // Negative or -0
+					bits = ^bits
+				}
+				buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(buf, bits)
+				propertyValueBytes = buf
+			}
+			ok = success
+		case BoolIndex:
+			boolValue, success := GetIndexableBoolValue(m, typeNameForLog, index.PropertyName)
+			if success {
+				if boolValue {
+					propertyValueBytes = []byte{1} // True
+				} else {
+					propertyValueBytes = []byte{0} // False
+				}
+			}
+			ok = success
+		case DateTimeIndex:
+			timeValue, success := GetIndexableDateTimeValue(m, typeNameForLog, index.PropertyName)
+			if success {
+				// RFC3339Nano is lexicographically sortable and human-readable.
+				// Pre-allocate buffer for efficiency. Max length of RFC3339Nano is 35.
+				propertyValueBytes = timeValue.AppendFormat(make([]byte, 0, 35), time.RFC3339Nano)
+			}
+			ok = success
+		default:
+			slog.Warn("BoltStore.Put: Unknown or unsupported index data type", "dataType", index.DataType.String(), "typeName", typeNameForLog, "property", index.PropertyName)
+			continue // Skip this index
+		}
+
+		if !ok {
+			// The GetIndexable<Type>Value function already logs the reason.
+			continue
+		}
+
+		idBytes := []byte(id.String())
+		indexKey := buildIndexKey(index.Type, propertyValueBytes, id)
+
+		if index.Type == UniqueIndex {
+			existingIdBytes := idxbucket.Get(indexKey)
+			if existingIdBytes != nil && !bytes.Equal(existingIdBytes, idBytes) {
+				// Value already exists for a different Storable ID, uniqueness constraint violation.
+				return fmt.Errorf("uniqueness constraint violation for index '%s' on property '%s': value already mapped to ID %s : %w",
+					index.PropertyName, string(indexBucketNameBytes), string(existingIdBytes), fault.ErrUniqueIndexConstraintViolation)
+			}
+		}
+
+		if err := idxbucket.Put(indexKey, idBytes); err != nil {
+			return fmt.Errorf("failed to put index entry for %s: %w", index.PropertyName, err)
+		}
+	}
+
+	return nil
 }
 
 // Put stores a Storable model.
@@ -72,105 +178,7 @@ func (bs *BoltStore) Put(m Storable) error {
 			return fault.ErrPutFailed
 		}
 
-		// Update any indexes
-		for _, index := range bs.typeManager.Indexes(uint64(id.TypeId)) {
-			indexBucketNameBytes, err := bs.mkIndexBucketName(id.TypeId, index.PropertyName)
-			if err != nil {
-				return err
-			}
-			slog.Debug("BoltStore.Put() indexing property", "indexBucketName", string(indexBucketNameBytes), "propertyName", index.PropertyName, "dataType", index.DataType.String())
-
-			typeNameForLog, _ := bs.typeManager.GetTypeName(id.TypeId) // Best effort for logging
-
-			idxbucket, err := tx.CreateBucketIfNotExists(indexBucketNameBytes)
-			if err != nil {
-				return fmt.Errorf("failed to create index bucket %s: %w", string(indexBucketNameBytes), fault.ErrBucketCreateFailed)
-			}
-
-			var propertyValueBytes []byte
-			var ok bool
-
-			switch index.DataType {
-			case StringIndex:
-				stringValue, success := GetIndexableStringValue(m, typeNameForLog, index.PropertyName)
-				if success {
-					propertyValueBytes = []byte(stringValue)
-				}
-				ok = success
-			case Int64Index:
-				intValue, success := GetIndexableIntValue(m, typeNameForLog, index.PropertyName)
-				if success {
-					// XOR with (1 << 63) to make signed int64 lexicographically sortable
-					// Negative numbers become 0..., positive numbers become 1...
-					uint64Val := uint64(intValue) ^ (1 << 63)
-					buf := make([]byte, 8)
-					binary.BigEndian.PutUint64(buf, uint64Val)
-					propertyValueBytes = buf
-				}
-				ok = success
-			case Float64Index:
-				floatValue, success := GetIndexableFloatValue(m, typeNameForLog, index.PropertyName)
-				if success {
-					bits := math.Float64bits(floatValue)
-					// For lexicographical sort of IEEE 754 floats:
-					// If positive (sign bit is 0), flip sign bit to 1.
-					// If negative (sign bit is 1), flip all bits.
-					if bits&(1<<63) == 0 { // Positive or +0
-						bits |= (1 << 63)
-					} else { // Negative or -0
-						bits = ^bits
-					}
-					buf := make([]byte, 8)
-					binary.BigEndian.PutUint64(buf, bits)
-					propertyValueBytes = buf
-				}
-				ok = success
-			case BoolIndex:
-				boolValue, success := GetIndexableBoolValue(m, typeNameForLog, index.PropertyName)
-				if success {
-					if boolValue {
-						propertyValueBytes = []byte{1} // True
-					} else {
-						propertyValueBytes = []byte{0} // False
-					}
-				}
-				ok = success
-			case DateTimeIndex:
-				timeValue, success := GetIndexableDateTimeValue(m, typeNameForLog, index.PropertyName)
-				if success {
-					// RFC3339Nano is lexicographically sortable and human-readable.
-					// Pre-allocate buffer for efficiency. Max length of RFC3339Nano is 35.
-					propertyValueBytes = timeValue.AppendFormat(make([]byte, 0, 35), time.RFC3339Nano)
-				}
-				ok = success
-			default:
-				slog.Warn("BoltStore.Put: Unknown or unsupported index data type", "dataType", index.DataType.String(), "typeName", typeNameForLog, "property", index.PropertyName)
-				continue // Skip this index
-			}
-
-			if !ok {
-				// The GetIndexable<Type>Value function already logs the reason.
-				continue
-			}
-
-			idBytes := []byte(id.String())
-			indexKey := buildIndexKey(index.Type, propertyValueBytes, id)
-
-			if index.Type == UniqueIndex {
-				existingIdBytes := idxbucket.Get(indexKey)
-				if existingIdBytes != nil && !bytes.Equal(existingIdBytes, idBytes) {
-					// Value already exists for a different Storable ID, uniqueness constraint violation.
-					return fmt.Errorf("uniqueness constraint violation for index '%s' on property '%s': value already mapped to ID %s",
-						index.PropertyName, string(indexBucketNameBytes), string(existingIdBytes))
-				}
-			}
-
-			if err := idxbucket.Put(indexKey, idBytes); err != nil {
-				return fmt.Errorf("failed to put index entry for %s: %w", index.PropertyName, err)
-			}
-		}
-
-		return nil
+		return bs.updateIndexes(tx, m)
 	})
 }
 
@@ -191,11 +199,6 @@ func (bs *BoltStore) PutAll(m []Storable) error {
 				return fault.ErrStorableHasNilId
 			}
 
-			// typeName, err := bs.typeManager.GetTypeName(id.TypeId)
-			// if err != nil {
-			// 	return fault.ErrTypeNotFound
-			// }
-			// bucketNameBytes := []byte(typeName)
 			bucketNameBytes, err := bs.typeBucketKey(id.TypeId)
 			if err != nil {
 				return err
@@ -214,6 +217,11 @@ func (bs *BoltStore) PutAll(m []Storable) error {
 			keyBytes := []byte(id.String())
 			if err := bucket.Put(keyBytes, data); err != nil {
 				return fault.ErrPutFailed
+			}
+
+			err = bs.updateIndexes(tx, item)
+			if err != nil {
+				return fault.ErrIndexUpdateFailed
 			}
 		}
 		return nil
@@ -322,19 +330,14 @@ func (bs *BoltStore) GetAllByTypeName(typeName string) ([]Storable, error) {
 
 // GetAll retrieves all Storable models of a given typeId.
 func (bs *BoltStore) GetAll(typeId int64) ([]Storable, error) {
-	// typeName, err := bs.typeManager.GetTypeName(typeId)
-	// if err != nil {
-	// 	return nil, fault.ErrTypeNotFound
-	// }
 	// Use typeName as the bucket name. Pass typeId for unmarshalling.
 	return bs.getAllFromBucket(typeId)
 }
 
 // getAllFromBucket is a helper to retrieve all items from a named bucket,
 // unmarshalling them as the given typeId.
-func (bs *BoltStore) getAllFromBucket( /*bucketName string,*/ typeId int64) ([]Storable, error) {
+func (bs *BoltStore) getAllFromBucket(typeId int64) ([]Storable, error) {
 	var results []Storable
-	//bucketNameBytes := []byte(bucketName)
 
 	bucketNameBytes, err := bs.typeBucketKey(typeId)
 	if err != nil {
@@ -407,7 +410,145 @@ func buildIndexKey(indexType IndexType, propertyValueBytes []byte, id *Id) []byt
 
 // Delete removes a model by its key.
 func (bs *BoltStore) Delete(id *Id) error {
-	panic("not implemented")
+	if id == nil {
+		return fault.ErrIdIsNil
+	}
+
+	// Step 1: Retrieve the storable. We need its actual data to correctly
+	// form the index keys that need to be deleted.
+	itemToDelete, err := bs.Get(id)
+	if err != nil {
+		if errors.Is(err, fault.ErrKeyNotFound) || errors.Is(err, fault.ErrBucketNotFound) {
+			// Item or its containing bucket doesn't exist, so it's effectively already "deleted".
+			slog.Debug("BoltStore.Delete: Item not found, considering delete successful", "id", id.String())
+			return nil
+		}
+		// Another error occurred during Get (e.g., unmarshal failed, type not created).
+		return fmt.Errorf("failed to retrieve item %s for deletion: %w", id.String(), err)
+	}
+
+	// If Get succeeded, itemToDelete should not be nil.
+	// This check is mostly for defensive programming.
+	if itemToDelete == nil {
+		slog.Warn("BoltStore.Delete: Get succeeded but returned nil item, considering delete successful", "id", id.String())
+		return nil
+	}
+
+	return bs.db.Update(func(tx *bbolt.Tx) error {
+		// Step 2: Delete the item from its primary type bucket.
+		bucketNameBytes, typeErr := bs.typeBucketKey(id.TypeId)
+		if typeErr != nil {
+			// This should ideally not happen if Get(id) succeeded, as Get also calls typeBucketKey.
+			return fmt.Errorf("failed to get type bucket key for deleting item %s: %w", id.String(), typeErr)
+		}
+
+		bucket := tx.Bucket(bucketNameBytes)
+		if bucket == nil {
+			// This is an inconsistent state if Get(id) succeeded, as Get would have returned ErrBucketNotFound.
+			// Log a warning and treat as if the item is already gone.
+			slog.Warn("BoltStore.Delete: Type bucket disappeared during transaction", "id", id.String(), "bucketName", string(bucketNameBytes))
+			return fault.ErrBucketNotFound // Or return nil if we consider it "already deleted"
+		}
+
+		keyBytes := []byte(id.String())
+		if err := bucket.Delete(keyBytes); err != nil {
+			// bbolt's Delete doesn't return an error if the key is not found.
+			// This would be for other underlying BoltDB errors.
+			return fmt.Errorf("failed to delete item %s from primary bucket %s: %w", id.String(), string(bucketNameBytes), err)
+		}
+		slog.Debug("BoltStore.Delete: Deleted item from primary bucket", "id", id.String(), "bucketName", string(bucketNameBytes))
+
+		// Step 3: Delete entries from all relevant index buckets.
+		// Use itemToDelete (which is 'Storable') to get indexed property values.
+		typeNameForLog, getTypeNameErr := bs.typeManager.GetTypeName(id.TypeId)
+		if getTypeNameErr != nil {
+			slog.Warn("BoltStore.Delete: Could not get type name for logging index cleanup", "typeId", id.TypeId, "error", getTypeNameErr)
+			typeNameForLog = fmt.Sprintf("typeId_%d", id.TypeId) // Fallback for logging context
+		}
+
+		for _, indexDef := range bs.typeManager.Indexes(id.TypeId) {
+			indexBucketNameBytes, err := bs.mkIndexBucketName(id.TypeId, indexDef.PropertyName)
+			if err != nil {
+				return fmt.Errorf("failed to create index bucket name for property '%s' of item %s: %w", indexDef.PropertyName, id.String(), err)
+			}
+
+			idxBucket := tx.Bucket(indexBucketNameBytes)
+			if idxBucket == nil {
+				// Index bucket doesn't exist, so no entry to delete for this index.
+				continue
+			}
+
+			var propertyValueBytes []byte
+			var ok bool
+
+			// This switch logic is similar to updateIndexes to get the value of the indexed property.
+			switch indexDef.DataType {
+			case StringIndex:
+				val, success := GetIndexableStringValue(itemToDelete, typeNameForLog, indexDef.PropertyName)
+				if success {
+					propertyValueBytes = []byte(val)
+				}
+				ok = success
+			case Int64Index:
+				val, success := GetIndexableIntValue(itemToDelete, typeNameForLog, indexDef.PropertyName)
+				if success {
+					uint64Val := uint64(val) ^ (1 << 63)
+					buf := make([]byte, 8)
+					binary.BigEndian.PutUint64(buf, uint64Val)
+					propertyValueBytes = buf
+				}
+				ok = success
+			case Float64Index:
+				val, success := GetIndexableFloatValue(itemToDelete, typeNameForLog, indexDef.PropertyName)
+				if success {
+					bits := math.Float64bits(val)
+					if bits&(1<<63) == 0 {
+						bits |= (1 << 63)
+					} else {
+						bits = ^bits
+					}
+					buf := make([]byte, 8)
+					binary.BigEndian.PutUint64(buf, bits)
+					propertyValueBytes = buf
+				}
+				ok = success
+			case BoolIndex:
+				val, success := GetIndexableBoolValue(itemToDelete, typeNameForLog, indexDef.PropertyName)
+				if success {
+					if val {
+						propertyValueBytes = []byte{1}
+					} else {
+						propertyValueBytes = []byte{0}
+					}
+				}
+				ok = success
+			case DateTimeIndex:
+				val, success := GetIndexableDateTimeValue(itemToDelete, typeNameForLog, indexDef.PropertyName)
+				if success {
+					propertyValueBytes = val.AppendFormat(make([]byte, 0, 35), time.RFC3339Nano)
+				}
+				ok = success
+			default:
+				slog.Warn("BoltStore.Delete: Unknown or unsupported index data type during index cleanup", "dataType", indexDef.DataType.String(), "typeName", typeNameForLog, "property", indexDef.PropertyName)
+				continue
+			}
+
+			if !ok {
+				// GetIndexable<Type>Value functions already log specific reasons for failure.
+				// If we couldn't get the value, we can't form the key to delete.
+				slog.Debug("BoltStore.Delete: Skipping index cleanup for property as value was not retrievable", "id", id.String(), "typeName", typeNameForLog, "property", indexDef.PropertyName)
+				continue
+			}
+
+			indexKey := buildIndexKey(indexDef.Type, propertyValueBytes, id)
+			if err := idxBucket.Delete(indexKey); err != nil {
+				// bbolt's Delete doesn't error if key not found. This would be for other DB errors.
+				return fmt.Errorf("failed to delete index entry for property '%s' from bucket '%s' (item %s): %w", indexDef.PropertyName, string(indexBucketNameBytes), id.String(), err)
+			}
+			slog.Debug("BoltStore.Delete: Deleted index entry", "id", id.String(), "property", indexDef.PropertyName, "indexBucketName", string(indexBucketNameBytes))
+		}
+		return nil
+	})
 }
 
 func (bs *BoltStore) AllocateId(item Storable) error {
