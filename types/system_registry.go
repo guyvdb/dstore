@@ -71,16 +71,16 @@ func NewRegistryItem(typeName string, factory TypeFactory) *RegistryItem {
 // later, on Load() it will assign the typeId assigned to this typename
 // or create a new typeid, if it is the first time seeing this type
 func (r *SystemRegistry) Register(typename string, factory TypeFactory) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// r.mu.Lock()
+	// defer r.mu.Unlock()
 
 	item := NewRegistryItem(typename, factory)
 	r.items = append(r.items, item)
 }
 
 func (r *SystemRegistry) Index(typeName string, propertyName string, dataType store.IndexDataType, indexType store.IndexType) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// r.mu.Lock()
+	// defer r.mu.Unlock()
 
 	for _, item := range r.items {
 		if item.TypeName == typeName {
@@ -90,8 +90,8 @@ func (r *SystemRegistry) Index(typeName string, propertyName string, dataType st
 }
 
 func (r *SystemRegistry) AllocateId(item store.Storable) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// r.mu.Lock()
+	// defer r.mu.Unlock()
 
 	info, found := r.typeNameIndex[item.GetTypeName()]
 	if !found {
@@ -127,8 +127,8 @@ func (r *SystemRegistry) Instance(typeId int64) (store.Storable, error) {
 		return &RegistryItem{}, nil
 	}
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// r.mu.RLock()
+	// defer r.mu.RUnlock()
 
 	// Otherwise it is a user defined types
 	info, found := r.typeIdIndex[typeId]
@@ -144,8 +144,8 @@ func (r *SystemRegistry) CreateInstance(typeId int64) (store.Storable, error) {
 }
 
 func (r *SystemRegistry) GetTypeId(typeName string) (int64, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	// r.mu.RLock()
+	// defer r.mu.RUnlock()
 
 	info, found := r.typeNameIndex[typeName]
 	if !found {
@@ -175,11 +175,11 @@ func (r *SystemRegistry) GetTypeName(typeId int64) (string, error) {
 	return info.TypeName, nil
 }
 
-func (r *SystemRegistry) Indexes(typeId uint64) []*store.IndexDefinition {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (r *SystemRegistry) Indexes(typeId int64) []*store.IndexDefinition {
+	// r.mu.RLock()
+	// defer r.mu.RUnlock()
 
-	info, found := r.typeIdIndex[int64(typeId)]
+	info, found := r.typeIdIndex[typeId]
 	if !found {
 		return []*store.IndexDefinition{}
 	}
@@ -196,8 +196,8 @@ func (r *SystemRegistry) Indexes(typeId uint64) []*store.IndexDefinition {
 //	be incremented.
 //	The nextObjectId for this typeId should be retreived.
 func (r *SystemRegistry) Load(s store.Store) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	// r.mu.Lock()
+	// defer r.mu.Unlock()
 
 	var info *RegistryInfo
 
